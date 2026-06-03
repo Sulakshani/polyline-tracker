@@ -1199,6 +1199,21 @@ function App() {
     setGeneratedPolyline(encodedPolyline);
   };
 
+  const reverseRouteDirection = () => {
+    if (!editableRoute || editableRoute.points.length < 2) {
+      alert("Please add at least 2 points before reversing the route");
+      return;
+    }
+
+    setEditableRoute({
+      ...editableRoute,
+      originCity: editableRoute.destinationCity,
+      destinationCity: editableRoute.originCity,
+      points: [...editableRoute.points].reverse(),
+    });
+    setGeneratedPolyline("");
+  };
+
   const saveToDatabase = async () => {
     if (!editableRoute || !generatedPolyline) {
       alert("Please generate the encoded polyline first");
@@ -2669,6 +2684,30 @@ function App() {
                     gap: "8px",
                   }}
                 >
+                  <button
+                    onClick={reverseRouteDirection}
+                    disabled={editableRoute.points.length < 2}
+                    style={{
+                      width: "100%",
+                      padding: "12px",
+                      borderRadius: "6px",
+                      fontWeight: "600",
+                      fontSize: "14px",
+                      color: "white",
+                      backgroundColor:
+                        editableRoute.points.length >= 2
+                          ? "#f97316"
+                          : "#9ca3af",
+                      border: "none",
+                      cursor:
+                        editableRoute.points.length >= 2
+                          ? "pointer"
+                          : "not-allowed",
+                    }}
+                  >
+                    🔄 Reverse Route Direction
+                  </button>
+
                   <button
                     onClick={generatePolyline}
                     disabled={editableRoute.points.length < 2}
