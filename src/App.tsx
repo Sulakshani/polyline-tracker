@@ -14,6 +14,7 @@ import { supabase, type MasterRoute } from "./lib/supabase";
 import {
   decodePolyline,
   encodePolyline,
+  decodePolylineWithSegments,
   calculateTimePerPoint,
   formatDuration,
   type LatLng,
@@ -737,7 +738,7 @@ function App() {
     setCityInputError("");
   };
 
-  const startEditExistingRoute = () => {
+  const startEditExistingRoute = async () => {
     if (!selectedRouteForEdit) {
       alert("Please select a route to edit");
       return;
@@ -751,6 +752,33 @@ function App() {
       polyline = polyline.replace(/\\\\/g, "\\");
     }
     const points = decodePolyline(polyline);
+
+    // Fetch existing stops
+    const { data: stopsData } = await supabase
+      .from("master_route_stops")
+      .select("*")
+      .eq("master_route_id", route.id);
+      
+    if (stopsData && stopsData.length > 0) {
+      stopsData.forEach((stop) => {
+        let minDistance = Infinity;
+        let closestIndex = -1;
+        points.forEach((p, index) => {
+          const dist = Math.sqrt(Math.pow(p.lat - Number(stop.latitude), 2) + Math.pow(p.lng - Number(stop.longitude), 2));
+          if (dist < minDistance) {
+            minDistance = dist;
+            closestIndex = index;
+          }
+        });
+        
+        // Threshold of ~100m for matching
+        if (closestIndex !== -1 && minDistance < 0.001) {
+          points[closestIndex].isStop = true;
+          points[closestIndex].stopName = stop.stop_name;
+          points[closestIndex].stopId = stop.id;
+        }
+      });
+    }
 
     setEditableRoute({
       routeId: route.id,
@@ -1221,6 +1249,8 @@ function App() {
     }
 
     try {
+      let activeRouteId = editableRoute.routeId;
+
       if (editableRoute.isNewRoute) {
         // Create new route
         const maxRouteNumber = routes.reduce((max, r) => {
@@ -1228,7 +1258,7 @@ function App() {
           return num > max ? num : max;
         }, 0);
 
-        const { error } = await supabase.from("master_routes").insert({
+        const { data: newRouteData, error } = await supabase.from("master_routes").insert({
           route_number: String(maxRouteNumber + 1),
           route_name: editableRoute.routeName,
           origin_city: editableRoute.originCity,
@@ -1237,10 +1267,12 @@ function App() {
           estimated_duration_minutes: 210,
           encoded_polyline: generatedPolyline,
           is_active: true,
-        });
+        }).select();
 
         if (error) throw error;
-        alert("Route created successfully!");
+        if (newRouteData && newRouteData.length > 0) {
+          activeRouteId = newRouteData[0].id;
+        }
       } else {
         // Update existing route
         const { error } = await supabase
@@ -1256,8 +1288,109 @@ function App() {
           .eq("id", editableRoute.routeId);
 
         if (error) throw error;
-        alert("Route updated successfully!");
       }
+
+      if (activeRouteId) {
+        // Decode polyline to get segments
+        const decodedData = decodePolylineWithSegments(generatedPolyline);
+        const formatUUID = (idx: number) => `00000000-0000-0000-0000-${String(idx).padStart(12, '0')}`;
+        const segmentPayloads = decodedData.segments.map((seg) => ({
+          master_route_id: activeRouteId,
+          start_point_type: seg.index === 0 ? "origin" : "stop",
+          start_point_id: formatUUID(seg.index),
+          end_point_type: seg.index === decodedData.segments.length - 1 ? "destination" : "stop",
+          end_point_id: formatUUID(seg.index + 1),
+          segment_order: seg.index + 1,
+          start_latitude: seg.startPoint.lat,
+          start_longitude: seg.startPoint.lng,
+          end_latitude: seg.endPoint.lat,
+          end_longitude: seg.endPoint.lng,
+          distance_km: Number(Math.max(Number(seg.distance) || 0, 0.1).toFixed(4)),
+          baseline_duration_minutes: 1,
+          baseline_speed_kmh: 40.0,
+        }));
+
+        // Delete existing route segments
+        await supabase.from("route_segments").delete().eq("master_route_id", activeRouteId);
+
+        // Insert new route segments
+        const chunkSize = 1000;
+        for (let i = 0; i < segmentPayloads.length; i += chunkSize) {
+          const chunk = segmentPayloads.slice(i, i + chunkSize);
+          const { error: segmentsError } = await supabase.from("route_segments").insert(chunk);
+          if (segmentsError) throw segmentsError;
+        }
+
+        // Handle master_route_stops
+        // Fetch existing stops first
+        const { data: existingStops } = await supabase
+          .from("master_route_stops")
+          .select("id")
+          .eq("master_route_id", activeRouteId);
+        
+        const existingStopIds = existingStops ? existingStops.map((s) => s.id) : [];
+        const currentStopIds: string[] = [];
+
+        // Prepare new and updated stops
+        const stopsToInsert: any[] = [];
+        const stopsToUpdate: any[] = [];
+
+        editableRoute.points
+          .filter(p => p.isStop && p.stopName && p.stopName.trim() !== "")
+          .forEach((p, idx) => {
+            const payload = {
+              master_route_id: activeRouteId,
+              stop_name: p.stopName!.trim(),
+              stop_order: idx + 1,
+              latitude: p.lat,
+              longitude: p.lng,
+              is_major_stop: true
+            };
+
+            if (p.stopId) {
+              currentStopIds.push(p.stopId);
+              stopsToUpdate.push({ id: p.stopId, ...payload });
+            } else {
+              stopsToInsert.push(payload);
+            }
+          });
+
+        // 1. Delete removed stops first
+        const removedStopIds = existingStopIds.filter(id => !currentStopIds.includes(id));
+        if (removedStopIds.length > 0) {
+          await supabase.from("master_route_stops").delete().in("id", removedStopIds);
+        }
+
+        // 2. Temporarily shift existing stops to negative orders to avoid unique_route_stop_order conflicts
+        if (stopsToUpdate.length > 0) {
+          const tempStops = stopsToUpdate.map((s, i) => ({ ...s, stop_order: -(i + 1000) }));
+          for (let i = 0; i < tempStops.length; i += chunkSize) {
+            const chunk = tempStops.slice(i, i + chunkSize);
+            const { error: tempError } = await supabase.from("master_route_stops").upsert(chunk);
+            if (tempError) throw tempError;
+          }
+        }
+
+        // 3. Insert new stops
+        if (stopsToInsert.length > 0) {
+          for (let i = 0; i < stopsToInsert.length; i += chunkSize) {
+            const chunk = stopsToInsert.slice(i, i + chunkSize);
+            const { error: stopsError } = await supabase.from("master_route_stops").insert(chunk);
+            if (stopsError) throw stopsError;
+          }
+        }
+
+        // 4. Update existing stops to their final correct orders
+        if (stopsToUpdate.length > 0) {
+          for (let i = 0; i < stopsToUpdate.length; i += chunkSize) {
+            const chunk = stopsToUpdate.slice(i, i + chunkSize);
+            const { error: stopsError } = await supabase.from("master_route_stops").upsert(chunk);
+            if (stopsError) throw stopsError;
+          }
+        }
+      }
+
+      alert(editableRoute.isNewRoute ? "Route created successfully!" : "Route updated successfully!");
 
       // Refresh routes
       const { data } = await supabase
@@ -1278,9 +1411,9 @@ function App() {
       setEditRouteNumber("");
       setHighlightedPointIndex(null);
       setGeneratedPolyline("");
-    } catch (err) {
+    } catch (err: any) {
       console.error("Error saving route:", err);
-      alert("Failed to save route");
+      alert(`Failed to save route: ${err?.message || err?.details || JSON.stringify(err)}`);
     }
   };
 
@@ -2621,15 +2754,13 @@ function App() {
                         key={index}
                         style={{
                           display: "flex",
-                          justifyContent: "space-between",
-                          alignItems: "center",
-                          padding: "6px 8px",
+                          flexDirection: "column",
+                          gap: "6px",
+                          padding: "8px",
                           borderBottom:
                             index < editableRoute.points.length - 1
                               ? "1px solid #e5e7eb"
                               : "none",
-                          fontSize: "12px",
-                          fontFamily: "monospace",
                           backgroundColor:
                             highlightedPointIndex === index
                               ? "#FEF3C7"
@@ -2638,40 +2769,69 @@ function App() {
                           transition: "background-color 0.3s ease",
                         }}
                       >
-                        <span
-                          onClick={() => focusOnPoint(index)}
-                          style={{
-                            color:
-                              highlightedPointIndex === index
-                                ? "#92400E"
-                                : "#374151",
-                            cursor: "pointer",
-                            flex: 1,
-                            fontWeight:
-                              highlightedPointIndex === index
-                                ? "600"
-                                : "normal",
-                          }}
-                          title="Click to view on map"
-                        >
-                          {index + 1}. {point.lat.toFixed(6)},{" "}
-                          {point.lng.toFixed(6)}
-                        </span>
-                        <button
-                          onClick={() => deletePoint(index)}
-                          style={{
-                            padding: "2px 8px",
-                            borderRadius: "4px",
-                            backgroundColor: "#fee2e2",
-                            color: "#ef4444",
-                            border: "none",
-                            cursor: "pointer",
-                            fontSize: "12px",
-                            fontWeight: "600",
-                          }}
-                        >
-                          ✕
-                        </button>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: "12px", fontFamily: "monospace" }}>
+                          <span
+                            onClick={() => focusOnPoint(index)}
+                            style={{
+                              color: highlightedPointIndex === index ? "#92400E" : "#374151",
+                              cursor: "pointer",
+                              flex: 1,
+                              fontWeight: highlightedPointIndex === index ? "600" : "normal",
+                            }}
+                            title="Click to view on map"
+                          >
+                            {index + 1}. {point.lat.toFixed(6)}, {point.lng.toFixed(6)}
+                          </span>
+                          <button
+                            onClick={() => deletePoint(index)}
+                            style={{
+                              padding: "2px 8px",
+                              borderRadius: "4px",
+                              backgroundColor: "#fee2e2",
+                              color: "#ef4444",
+                              border: "none",
+                              cursor: "pointer",
+                              fontSize: "12px",
+                              fontWeight: "600",
+                            }}
+                          >
+                            ✕
+                          </button>
+                        </div>
+                        <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+                          <label style={{ fontSize: "12px", display: "flex", alignItems: "center", gap: "4px", color: "#4b5563", cursor: "pointer" }}>
+                            <input
+                              type="checkbox"
+                              checked={point.isStop || false}
+                              onChange={(e) => {
+                                const newPoints = [...editableRoute.points];
+                                newPoints[index] = { ...point, isStop: e.target.checked };
+                                setEditableRoute({ ...editableRoute, points: newPoints });
+                              }}
+                              style={{ cursor: "pointer" }}
+                            />
+                            Mark as Stop
+                          </label>
+                          {point.isStop && (
+                            <input
+                              type="text"
+                              placeholder="Stop Name"
+                              value={point.stopName || ""}
+                              onChange={(e) => {
+                                const newPoints = [...editableRoute.points];
+                                newPoints[index] = { ...point, stopName: e.target.value };
+                                setEditableRoute({ ...editableRoute, points: newPoints });
+                              }}
+                              style={{
+                                flex: 1,
+                                padding: "4px 8px",
+                                fontSize: "12px",
+                                border: "1px solid #d1d5db",
+                                borderRadius: "4px",
+                              }}
+                            />
+                          )}
+                        </div>
                       </div>
                     ))}
                   </div>
